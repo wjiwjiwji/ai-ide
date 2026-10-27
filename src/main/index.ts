@@ -3,9 +3,12 @@ import {
   BrowserWindow,
   dialog,
   ipcMain,
+  Menu,
+  nativeTheme,
   safeStorage,
   shell,
   webContents as electronWebContents,
+  type MenuItemConstructorOptions,
   type WebContents,
   type OpenDialogOptions
 } from 'electron'
@@ -14,6 +17,7 @@ import {
   exec
 } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
+import { freemem, totalmem } from 'node:os'
 import {
   copyFile,
   lstat,
@@ -28,11 +32,14 @@ import {
 } from 'node:fs/promises'
 import {
   basename,
+  dirname,
   join,
   relative,
   resolve
 } from 'node:path'
 import type {
+  AgentCodeCompletionRequest,
+  AgentCodeCompletionResult,
   AgentCheckpointInfo,
   AgentProvider,
   AgentProviderStatus,
@@ -42,9 +49,17 @@ import type {
   AgentTaskSaveInput,
   AgentTaskSummary,
   AppInfo,
+  AppMenuCommand,
   AppUpdateStatus,
   CodeIndexStatus,
   CodeSearchResult,
+  CppRunPreparation,
+  CppSyntaxCheckResult,
+  CreateProjectInput,
+  CreateWorkspaceEntryInput,
+  DebugBreakpoint,
+  DebuggerSnapshot,
+  EditAction,
   CheckpointDiff,
   CheckpointFileChange,
   CheckpointFileDiff,
@@ -53,29 +68,57 @@ import type {
   FileEntry,
   GitCommitResult,
   GitFileDiff,
+  GitignoreRepairResult,
   GitStatus,
+  MemoryMetrics,
   ProjectInfo,
+  ProjectAvailability,
   ProjectWorkflow,
+  PythonRunPreparation,
+  RenameWorkspaceEntryInput,
   TerminalSessionInfo,
   WorkflowRunRecord,
   WorkflowRunResult,
   WorkflowRunSummary,
   WorkflowStepResult,
-  WorkflowTemplate
+  WorkflowTemplate,
+  WorkspaceViewSlot
 } from '../shared/desktop'
+import { PROJECT_TEMPLATES } from '../shared/desktop'
 import { parseProjectDiagnostics } from './core/diagnostics'
+import { isCheckpointIgnoredDirectory } from './core/checkpoint-policy'
+import {
+  createDeepSeekAgentCompletionRequest,
+  generateAgentCodeCompletion
+} from './core/agent-completion'
 import {
   extractCodeSymbols,
   getFileLanguage,
   indexableExtensions
 } from './core/code-symbols'
 import { GitService } from './core/git-service'
+import { ensureRecommendedGitignore } from './core/gitignore'
+import {
+  compileCppForDebug,
+  prepareCppRun,
+  syntaxCheckCppSource
+} from './core/cpp-runner'
+import { preparePythonRun } from './core/python-runner'
+import { DebugSession } from './core/debug-session'
 import { assertPathInside } from './core/path-security'
 import { TerminalService } from './core/terminal-service'
 import { AppDatabase } from './core/persistence'
+import {
+  createProjectDirectory,
+  projectTemplateCommands,
+  scaffoldProject
+} from './core/project-service'
 import { resolveCodexExecutable as findCodexExecutable } from './core/codex-agent'
 import { AgentCoordinator } from './core/agent-coordinator'
-import { createElectronUpdateAdapter } from './core/electron-update-adapter'
+import {
+  configureUpdateNetwork,
+  createElectronUpdateAdapter
+} from './core/electron-update-adapter'
 import { UpdateService } from './core/update-service'
 import { truncateAgentOutput } from './core/text-utils'
 import {
@@ -92,10 +135,28 @@ import {
 const isDevelopment = !app.isPackaged
 const maxFileSize = MAX_TEXT_FILE_SIZE
 const ignoredDirectoryNames = DEFAULT_IGNORED_DIRECTORIES
+configureUpdateNetwork()
+nativeTheme.themeSource = 'dark'
+const localCppToolchainRoot = join(
+  app.isPackaged ? process.resourcesPath : app.getAppPath(),
+  app.isPackaged
+    ? join('debug-adapters', 'gdb')
+    : join('.debugger', 'msys2', 'ucrt64')
+)
+if (!process.env.AI_IDE_LOCAL_CPP_COMPILER) {
+  process.env.AI_IDE_LOCAL_CPP_COMPILER = join(
+    localCppToolchainRoot,
+    'bin',
+    'g++.exe'
+  )
+}
 
 let currentProject: ProjectInfo | null = null
 let workspaceFileService: WorkspaceFileService | null = null
 let gitService: GitService | null = null
+let allowApplicationClose = false
+let closeCleanupComplete = false
+const unsavedFileCounts = new Map<number, number>()
 const terminalService = new TerminalService({
   onData: (ownerId, event) => {
     const owner = electronWebContents.fromId(ownerId)
@@ -130,10 +191,26 @@ const updateService = new UpdateService(
 )
 let cachedCodexExecutable: string | null = null
 let persistenceDatabase: AppDatabase | null = null
+let debugSession: DebugSession | null = null
+let debugStartAbortController: AbortController | null = null
+const idleDebugSnapshot: DebuggerSnapshot = {
+  state: 'idle',
+  message: '未启动调试会话。',
+  frames: [],
+  variables: [],
+  threads: [],
+  programOutput: [],
+  output: []
+}
 const codeIndexStates = new Map<string, CodeIndexStatus>()
 let codeIndexGeneration = 0
 const diagnosticsResults = new Map<string, DiagnosticsResult>()
 let diagnosticsGeneration = 0
+const agentCompletionControllers = new Map<number, AbortController>()
+const agentCompletionCache = new Map<
+  string,
+  { expiresAt: number; completion: string }
+>()
 
 interface RecentProjectsStore {
   projects: ProjectInfo[]
@@ -273,6 +350,90 @@ async function clearDeepSeekApiKey(): Promise<AgentProviderStatus> {
   return getAgentProviderStatus()
 }
 
+async function getAgentCodeCompletion(
+  senderId: number,
+  input: AgentCodeCompletionRequest
+): Promise<AgentCodeCompletionResult> {
+  if (
+    !input ||
+    typeof input.path !== 'string' ||
+    typeof input.language !== 'string' ||
+    typeof input.prefix !== 'string' ||
+    typeof input.suffix !== 'string'
+  ) {
+    return {
+      completion: '',
+      cached: false,
+      error: '代码补全请求格式无效。'
+    }
+  }
+
+  const request: AgentCodeCompletionRequest = {
+    path: input.path.slice(-500),
+    language: input.language.slice(0, 80),
+    prefix: input.prefix.slice(-24_000),
+    suffix: input.suffix.slice(0, 12_000)
+  }
+  if (!request.prefix.trim()) {
+    return { completion: '', cached: false }
+  }
+
+  const apiKey = await getDeepSeekApiKey()
+  if (!apiKey) {
+    return {
+      completion: '',
+      cached: false,
+      error:
+        'AI 补全需要 DeepSeek API Key，请先在 Agent 工作台完成配置。'
+    }
+  }
+
+  const model = process.env.DEEPSEEK_MODEL?.trim() || 'deepseek-chat'
+  const cacheKey = JSON.stringify([model, request])
+  const cached = agentCompletionCache.get(cacheKey)
+  if (cached && cached.expiresAt > Date.now()) {
+    return { completion: cached.completion, cached: true }
+  }
+
+  agentCompletionControllers.get(senderId)?.abort()
+  const controller = new AbortController()
+  agentCompletionControllers.set(senderId, controller)
+  try {
+    const completion = await generateAgentCodeCompletion({
+      request,
+      signal: controller.signal,
+      complete: createDeepSeekAgentCompletionRequest(apiKey, model)
+    })
+    if (!controller.signal.aborted && completion) {
+      agentCompletionCache.set(cacheKey, {
+        completion,
+        expiresAt: Date.now() + 45_000
+      })
+      if (agentCompletionCache.size > 80) {
+        const oldestKey = agentCompletionCache.keys().next().value
+        if (oldestKey) {
+          agentCompletionCache.delete(oldestKey)
+        }
+      }
+    }
+    return { completion, cached: false }
+  } catch (error) {
+    if (controller.signal.aborted) {
+      return { completion: '', cached: false }
+    }
+    return {
+      completion: '',
+      cached: false,
+      error:
+        error instanceof Error ? error.message : '生成代码补全失败。'
+    }
+  } finally {
+    if (agentCompletionControllers.get(senderId) === controller) {
+      agentCompletionControllers.delete(senderId)
+    }
+  }
+}
+
 function getPersistenceDatabase(): AppDatabase {
   if (!persistenceDatabase) {
     persistenceDatabase = new AppDatabase(
@@ -325,7 +486,10 @@ async function copyProjectSnapshot(
     if (entry.isSymbolicLink()) {
       continue
     }
-    if (entry.isDirectory() && ignoredDirectoryNames.has(entry.name)) {
+    if (
+      entry.isDirectory() &&
+      isCheckpointIgnoredDirectory(entry.name)
+    ) {
       continue
     }
 
@@ -407,7 +571,10 @@ async function collectProjectTypes(
 ): Promise<Map<string, 'file' | 'directory' | 'other'>> {
   const entries = await readdir(currentPath, { withFileTypes: true })
   for (const entry of entries) {
-    if (entry.isDirectory() && ignoredDirectoryNames.has(entry.name)) {
+    if (
+      entry.isDirectory() &&
+      isCheckpointIgnoredDirectory(entry.name)
+    ) {
       continue
     }
     const absolutePath = join(currentPath, entry.name)
@@ -431,7 +598,10 @@ async function cleanTargetToSnapshot(
 ): Promise<void> {
   const entries = await readdir(targetPath, { withFileTypes: true })
   for (const entry of entries) {
-    if (entry.isDirectory() && ignoredDirectoryNames.has(entry.name)) {
+    if (
+      entry.isDirectory() &&
+      isCheckpointIgnoredDirectory(entry.name)
+    ) {
       continue
     }
     const absolutePath = join(targetPath, entry.name)
@@ -1521,15 +1691,38 @@ async function resolveProjectPath(path: string): Promise<string> {
 async function activateProject(path: string): Promise<ProjectInfo> {
   const projectPath = await resolveProjectPath(path)
   const project = createProjectInfo(projectPath)
-  terminalService.killAll()
-  agentCoordinator.killAll()
-  diagnosticsGeneration += 1
+  stopActiveProjectServices()
   currentProject = project
   workspaceFileService = new WorkspaceFileService(project.path)
   gitService = new GitService(project.path)
   void rebuildProjectCodeIndex(project)
   await rememberProject(project)
   return project
+}
+
+function stopActiveProjectServices(): void {
+  terminalService.killAll()
+  agentCoordinator.killAll()
+  debugStartAbortController?.abort()
+  debugStartAbortController = null
+  debugSession?.dispose()
+  debugSession = null
+  broadcastDebuggerSnapshot(idleDebugSnapshot)
+  diagnosticsGeneration += 1
+}
+
+async function closeCurrentProject(): Promise<void> {
+  const projectPath = currentProject?.path
+  stopActiveProjectServices()
+  currentProject = null
+  workspaceFileService = null
+  gitService = null
+  if (projectPath) {
+    const recentProjects = await readRecentProjects()
+    await writeRecentProjects(
+      recentProjects.filter((project) => project.path !== projectPath)
+    )
+  }
 }
 
 async function resolveWorkspacePath(relativePath: string): Promise<{
@@ -1552,6 +1745,220 @@ async function saveWorkspaceFile(
   content: string
 ): Promise<void> {
   return getWorkspaceFileService().saveText(relativePath, content)
+}
+
+async function createWorkspaceEntry(
+  input: CreateWorkspaceEntryInput
+): Promise<FileEntry> {
+  if (!input || typeof input !== 'object') {
+    throw new Error('创建参数无效。')
+  }
+  return getWorkspaceFileService().createEntry(
+    typeof input.directoryPath === 'string' ? input.directoryPath : '',
+    input.type,
+    input.name,
+    typeof input.content === 'string' ? input.content : '',
+    input.createParentDirectories === true
+  )
+}
+
+async function renameWorkspaceEntry(
+  input: RenameWorkspaceEntryInput
+): Promise<FileEntry> {
+  if (!input || typeof input !== 'object') {
+    throw new Error('重命名参数无效。')
+  }
+  return getWorkspaceFileService().renameEntry(input.path, input.name)
+}
+
+async function resolveExistingWorkspaceEntry(
+  relativePath: string,
+  allowRoot = false
+): Promise<string> {
+  if (typeof relativePath !== 'string' || !relativePath.trim()) {
+    throw new Error('不能操作项目根目录。')
+  }
+  const { projectRoot, targetPath } = await resolveWorkspacePath(relativePath)
+  const realTargetPath = await realpath(targetPath)
+  assertPathInside(projectRoot, realTargetPath)
+  if (!allowRoot && realTargetPath === projectRoot) {
+    throw new Error('不能操作项目根目录。')
+  }
+  return realTargetPath
+}
+
+async function trashWorkspaceEntry(relativePath: string): Promise<void> {
+  await shell.trashItem(await resolveExistingWorkspaceEntry(relativePath))
+}
+
+async function deleteWorkspaceEntry(relativePath: string): Promise<void> {
+  await getWorkspaceFileService().deleteEntry(relativePath)
+}
+
+async function revealWorkspaceEntry(relativePath: string): Promise<void> {
+  shell.showItemInFolder(
+    await resolveExistingWorkspaceEntry(relativePath, true)
+  )
+}
+
+async function prepareWorkspaceCppRun(
+  relativePath: string
+): Promise<CppRunPreparation> {
+  const project = ensureCurrentProject()
+  const { targetPath } = await resolveWorkspacePath(relativePath)
+  return prepareCppRun({
+    projectRoot: project.path,
+    sourcePath: targetPath,
+    relativeSourcePath: relativePath,
+    outputRoot: join(app.getPath('temp'), 'ai-ide-cpp-runs')
+  })
+}
+
+async function prepareWorkspacePythonRun(
+  relativePath: string
+): Promise<PythonRunPreparation> {
+  const project = ensureCurrentProject()
+  const { targetPath } = await resolveWorkspacePath(relativePath)
+  return preparePythonRun({
+    projectRoot: project.path,
+    sourcePath: targetPath,
+    relativeSourcePath: relativePath
+  })
+}
+
+async function checkWorkspaceCppSyntax(
+  relativePath: string,
+  content: string
+): Promise<CppSyntaxCheckResult> {
+  const project = ensureCurrentProject()
+  const { targetPath } = await resolveWorkspacePath(relativePath)
+  return syntaxCheckCppSource({
+    projectRoot: project.path,
+    sourcePath: targetPath,
+    content
+  })
+}
+
+function broadcastDebuggerSnapshot(snapshot: DebuggerSnapshot): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) {
+      window.webContents.send('debug:snapshot', snapshot)
+    }
+  }
+}
+
+async function startWorkspaceCppDebug(
+  relativePath: string,
+  breakpoints: DebugBreakpoint[]
+): Promise<DebuggerSnapshot> {
+  debugStartAbortController?.abort()
+  const abortController = new AbortController()
+  debugStartAbortController = abortController
+  const project = ensureCurrentProject()
+  try {
+    const { targetPath } = await resolveWorkspacePath(relativePath)
+    const debugRoot = app.isPackaged
+      ? join(process.resourcesPath, 'debug-adapters')
+      : join(app.getAppPath(), '.debugger')
+    const adapterPath = app.isPackaged
+      ? join(debugRoot, 'cpptools', 'bin', 'OpenDebugAD7.exe')
+      : join(
+          debugRoot,
+          'cpptools-win',
+          'extension',
+          'debugAdapters',
+          'bin',
+          'OpenDebugAD7.exe'
+        )
+    const gdbPath = join(
+      debugRoot,
+      app.isPackaged ? 'gdb' : 'msys2',
+      app.isPackaged ? 'bin' : 'ucrt64\\bin',
+      'gdb.exe'
+    )
+    for (const requiredPath of [adapterPath, gdbPath]) {
+      if (!(await lstat(requiredPath).catch(() => null))) {
+        throw new Error(`调试组件不存在：${requiredPath}`)
+      }
+    }
+
+    const build = await compileCppForDebug({
+      projectRoot: project.path,
+      sourcePath: targetPath,
+      relativeSourcePath: relativePath,
+      outputRoot: join(app.getPath('temp'), 'ai-ide-cpp-runs'),
+      signal: abortController.signal
+    })
+    if (abortController.signal.aborted) {
+      throw new Error('调试已取消。')
+    }
+    debugSession?.dispose()
+    const session = new DebugSession()
+    debugSession = session
+    session.on('snapshot', broadcastDebuggerSnapshot)
+    try {
+      return await session.start({
+        adapterPath,
+        adapterCwd: dirname(adapterPath),
+        gdbPath,
+        program: build.executablePath,
+        cwd: project.path,
+        buildOutput: `${build.output}\nDebugger: ${build.compiler} + GDB`,
+        breakpoints: Array.isArray(breakpoints)
+          ? breakpoints
+              .filter(
+                (breakpoint) =>
+                  breakpoint &&
+                  typeof breakpoint.path === 'string' &&
+                  Number.isInteger(breakpoint.line)
+              )
+              .slice(0, 200)
+              .map((breakpoint) => ({
+                path: resolve(project.path, breakpoint.path),
+                line: Math.max(1, breakpoint.line)
+              }))
+          : []
+      })
+    } catch (error) {
+      session.dispose()
+      if (debugSession === session) {
+        debugSession = null
+      }
+      throw error
+    }
+  } catch (error) {
+    if (abortController.signal.aborted) {
+      throw new Error('调试已取消。')
+    }
+    throw error
+  } finally {
+    if (debugStartAbortController === abortController) {
+      debugStartAbortController = null
+    }
+  }
+}
+
+async function setWorkspaceDebugBreakpoints(
+  breakpoints: DebugBreakpoint[]
+): Promise<void> {
+  if (!debugSession) {
+    return
+  }
+  const project = ensureCurrentProject()
+  await debugSession.setBreakpoints(
+    breakpoints
+      .filter(
+        (breakpoint) =>
+          breakpoint &&
+          typeof breakpoint.path === 'string' &&
+          Number.isInteger(breakpoint.line)
+      )
+      .slice(0, 200)
+      .map((breakpoint) => ({
+        path: resolve(project.path, breakpoint.path),
+        line: Math.max(1, breakpoint.line)
+      }))
+  )
 }
 
 async function getGitStatus(): Promise<GitStatus> {
@@ -1683,6 +2090,32 @@ async function startAgentRun(
   throw new Error('不支持的 Agent Provider。')
 }
 
+function sendCloseRequest(window: BrowserWindow): void {
+  if (!window.isDestroyed()) {
+    window.webContents.send('app:close-requested')
+  }
+}
+
+function requestCloseWithUnsavedCheck(): void {
+  if (allowApplicationClose) {
+    app.quit()
+    return
+  }
+  const windowsWithUnsavedFiles = BrowserWindow.getAllWindows().filter(
+    (window) =>
+      !window.isDestroyed() &&
+      (unsavedFileCounts.get(window.webContents.id) ?? 0) > 0
+  )
+  if (windowsWithUnsavedFiles.length > 0) {
+    for (const window of windowsWithUnsavedFiles) {
+      sendCloseRequest(window)
+    }
+    return
+  }
+  allowApplicationClose = true
+  app.quit()
+}
+
 function createWindow(): void {
   const mainWindow = new BrowserWindow({
     width: 1440,
@@ -1690,7 +2123,13 @@ function createWindow(): void {
     minWidth: 960,
     minHeight: 640,
     show: false,
-    autoHideMenuBar: true,
+    autoHideMenuBar: false,
+    titleBarStyle: 'hidden',
+    titleBarOverlay: {
+      color: '#0d1013',
+      symbolColor: '#d8ddd5',
+      height: 32
+    },
     backgroundColor: '#0d1013',
     title: 'AI IDE',
     webPreferences: {
@@ -1704,6 +2143,7 @@ function createWindow(): void {
   mainWindow.once('ready-to-show', () => {
     mainWindow.show()
   })
+  const windowWebContentsId = mainWindow.webContents.id
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('https://')) {
@@ -1720,12 +2160,365 @@ function createWindow(): void {
     }
   })
 
+  mainWindow.on('close', (event) => {
+    if (allowApplicationClose) {
+      return
+    }
+    if ((unsavedFileCounts.get(windowWebContentsId) ?? 0) > 0) {
+      event.preventDefault()
+      sendCloseRequest(mainWindow)
+    }
+  })
+
+  mainWindow.on('closed', () => {
+    unsavedFileCounts.delete(windowWebContentsId)
+  })
+
   const rendererUrl = process.env.ELECTRON_RENDERER_URL
   if (isDevelopment && rendererUrl) {
     void mainWindow.loadURL(rendererUrl)
   } else {
     void mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   }
+}
+
+function sendAppMenuCommand(command: AppMenuCommand): void {
+  const window =
+    BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows().at(0)
+  if (window && !window.isDestroyed()) {
+    window.webContents.send('app-menu:command', command)
+  }
+}
+
+function createApplicationMenu(): void {
+  const template: MenuItemConstructorOptions[] = [
+    {
+      label: '文件',
+      submenu: [
+        {
+          label: '设置…',
+          accelerator: 'Ctrl+,',
+          click: () => sendAppMenuCommand('app:settings')
+        },
+        { type: 'separator' },
+        {
+          label: '新建项目…',
+          accelerator: 'Ctrl+Shift+N',
+          click: () => sendAppMenuCommand('project:new')
+        },
+        {
+          label: '打开项目…',
+          accelerator: 'Ctrl+O',
+          click: () => sendAppMenuCommand('project:open')
+        },
+        { type: 'separator' },
+        {
+          label: '保存',
+          accelerator: 'Ctrl+S',
+          click: () => sendAppMenuCommand('file:save')
+        },
+        {
+          label: '关闭编辑器',
+          accelerator: 'Ctrl+W',
+          click: () => sendAppMenuCommand('file:close-editor')
+        },
+        { type: 'separator' },
+        { label: '退出', role: 'quit' }
+      ]
+    },
+    {
+      label: '编辑',
+      submenu: [
+        { label: '撤销', role: 'undo' },
+        { label: '重做', role: 'redo' },
+        { type: 'separator' },
+        { label: '剪切', role: 'cut' },
+        { label: '复制', role: 'copy' },
+        { label: '粘贴', role: 'paste' },
+        { label: '删除', role: 'delete' }
+      ]
+    },
+    {
+      label: '选择',
+      submenu: [
+        { label: '全选', role: 'selectAll' },
+        { type: 'separator' },
+        {
+          label: '打开命令面板',
+          click: () => sendAppMenuCommand('command-palette:open')
+        }
+      ]
+    },
+    {
+      label: '视图',
+      submenu: [
+        {
+          label: '命令面板…',
+          accelerator: 'Ctrl+Shift+P',
+          click: () => sendAppMenuCommand('command-palette:open')
+        },
+        { type: 'separator' },
+        {
+          label: '资源管理器',
+          accelerator: 'Ctrl+Shift+E',
+          click: () => sendAppMenuCommand('view:explorer')
+        },
+        {
+          label: '搜索代码',
+          accelerator: 'Ctrl+Shift+F',
+          click: () => sendAppMenuCommand('view:search')
+        },
+        {
+          label: '源码管理',
+          accelerator: 'Ctrl+Shift+G',
+          click: () => sendAppMenuCommand('view:source-control')
+        },
+        {
+          label: '运行',
+          accelerator: 'Ctrl+Shift+D',
+          click: () => sendAppMenuCommand('view:run')
+        },
+        {
+          label: 'Agent',
+          accelerator: 'Ctrl+Alt+I',
+          click: () => sendAppMenuCommand('view:agent')
+        },
+        { type: 'separator' },
+        {
+          label: '问题',
+          accelerator: 'Ctrl+Shift+M',
+          click: () => sendAppMenuCommand('view:problems')
+        },
+        {
+          label: '错误列表',
+          click: () => sendAppMenuCommand('view:error-list')
+        },
+        {
+          label: '诊断工具',
+          click: () => sendAppMenuCommand('view:diagnostic-tools')
+        },
+        {
+          label: '输出',
+          accelerator: 'Ctrl+Shift+U',
+          click: () => sendAppMenuCommand('view:output')
+        },
+        {
+          label: '调试控制台',
+          accelerator: 'Ctrl+Shift+Y',
+          click: () => sendAppMenuCommand('view:debug-console')
+        },
+        {
+          label: '调用堆栈',
+          click: () => sendAppMenuCommand('view:call-stack')
+        },
+        {
+          label: '内存',
+          click: () => sendAppMenuCommand('view:memory')
+        },
+        {
+          label: '终端',
+          accelerator: 'Ctrl+`',
+          click: () => sendAppMenuCommand('view:toggle-terminal')
+        },
+        {
+          label: '显示或隐藏底部面板',
+          accelerator: 'Ctrl+J',
+          click: () => sendAppMenuCommand('view:toggle-bottom-panel')
+        },
+        { type: 'separator' },
+        {
+          label: '显示或隐藏活动栏',
+          click: () => sendAppMenuCommand('view:toggle-activity-bar')
+        },
+        {
+          label: '显示或隐藏侧边栏',
+          accelerator: 'Ctrl+B',
+          click: () => sendAppMenuCommand('view:toggle-sidebar')
+        },
+        {
+          label: '显示或隐藏右侧栏',
+          accelerator: 'Ctrl+Alt+B',
+          click: () => sendAppMenuCommand('view:toggle-inspector')
+        },
+        {
+          label: '将右侧栏停靠到右侧',
+          click: () => sendAppMenuCommand('view:dock-inspector-right')
+        },
+        {
+          label: '将右侧栏停靠到底部',
+          click: () => sendAppMenuCommand('view:dock-inspector-bottom')
+        },
+        { type: 'separator' },
+        {
+          label: '保存视图',
+          submenu: ([1, 2, 3, 4, 5] as WorkspaceViewSlot[]).map((slot) => ({
+            label: `保存到方案 ${slot}`,
+            click: () =>
+              sendAppMenuCommand(`view:save-scheme-${slot}`)
+          }))
+        },
+        {
+          label: '应用视图',
+          submenu: ([1, 2, 3, 4, 5] as WorkspaceViewSlot[]).map((slot) => ({
+            label: `应用方案 ${slot}`,
+            click: () =>
+              sendAppMenuCommand(`view:apply-scheme-${slot}`)
+          }))
+        },
+        {
+          label: '自动换行',
+          accelerator: 'Alt+Z',
+          click: () => sendAppMenuCommand('view:toggle-word-wrap')
+        },
+        {
+          label: '重置窗口布局',
+          click: () => sendAppMenuCommand('view:reset-layout')
+        },
+        { type: 'separator' },
+        { label: '切换全屏', role: 'togglefullscreen' }
+      ]
+    },
+    {
+      label: '转到',
+      submenu: [
+        {
+          label: '转到文件…',
+          accelerator: 'Ctrl+P',
+          click: () => sendAppMenuCommand('command-palette:files')
+        },
+        {
+          label: '转到行…',
+          accelerator: 'Ctrl+G',
+          click: () => sendAppMenuCommand('editor:goto-line')
+        },
+        { type: 'separator' },
+        {
+          label: '下一个编辑器',
+          accelerator: 'Ctrl+Tab',
+          click: () => sendAppMenuCommand('editor:next')
+        },
+        {
+          label: '上一个编辑器',
+          accelerator: 'Ctrl+Shift+Tab',
+          click: () => sendAppMenuCommand('editor:previous')
+        }
+      ]
+    },
+    {
+      label: '运行',
+      submenu: [
+        {
+          label: '启动调试',
+          accelerator: 'F5',
+          click: () => sendAppMenuCommand('debug:start')
+        },
+        {
+          label: '继续',
+          click: () => sendAppMenuCommand('debug:continue')
+        },
+        {
+          label: '暂停',
+          click: () => sendAppMenuCommand('debug:pause')
+        },
+        {
+          label: '单步跳过',
+          accelerator: 'F10',
+          click: () => sendAppMenuCommand('debug:step-over')
+        },
+        {
+          label: '单步进入',
+          accelerator: 'F11',
+          click: () => sendAppMenuCommand('debug:step-in')
+        },
+        {
+          label: '单步退出',
+          accelerator: 'Shift+F11',
+          click: () => sendAppMenuCommand('debug:step-out')
+        },
+        {
+          label: '切换断点',
+          accelerator: 'F9',
+          click: () => sendAppMenuCommand('debug:toggle-breakpoint')
+        },
+        {
+          label: '停止调试',
+          accelerator: 'Shift+F5',
+          click: () => sendAppMenuCommand('debug:stop')
+        },
+        { type: 'separator' },
+        {
+          label: '运行当前 C/C++ 文件',
+          accelerator: 'Ctrl+F5',
+          click: () => sendAppMenuCommand('file:run-cpp')
+        },
+        {
+          label: '运行当前 Python 文件',
+          accelerator: 'Shift+F10',
+          click: () => sendAppMenuCommand('file:run-python')
+        },
+        { type: 'separator' },
+        {
+          label: '运行项目',
+          click: () => sendAppMenuCommand('terminal:run')
+        },
+        {
+          label: '运行诊断',
+          click: () => sendAppMenuCommand('diagnostics:run')
+        },
+        {
+          label: '运行工作流…',
+          click: () => sendAppMenuCommand('workflow:open')
+        },
+        {
+          label: '打开 Agent',
+          click: () => sendAppMenuCommand('agent:open')
+        }
+      ]
+    },
+    {
+      label: '终端',
+      submenu: [
+        {
+          label: '显示终端',
+          accelerator: 'Ctrl+`',
+          click: () => sendAppMenuCommand('terminal:open')
+        },
+        {
+          label: '运行已保存命令',
+          click: () => sendAppMenuCommand('terminal:run')
+        }
+      ]
+    },
+    {
+      label: '帮助',
+      submenu: [
+        {
+          label: '使用指南',
+          click: () => {
+            void shell.openExternal(
+              'https://github.com/wjiwjiwji/ai-ide#readme'
+            )
+          }
+        },
+        {
+          label: 'GitHub 仓库',
+          click: () => {
+            void shell.openExternal('https://github.com/wjiwjiwji/ai-ide')
+          }
+        },
+        {
+          label: '检查更新',
+          click: () => sendAppMenuCommand('updates:check')
+        },
+        { type: 'separator' },
+        {
+          label: '关于 AI IDE',
+          click: () => sendAppMenuCommand('help:about')
+        }
+      ]
+    }
+  ]
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template))
 }
 
 function registerIpcHandlers(): void {
@@ -1754,12 +2547,166 @@ function registerIpcHandlers(): void {
     updateService.installUpdate()
   })
 
+  ipcMain.handle('edit:perform', (event, action: EditAction): void => {
+    switch (action) {
+      case 'undo':
+        event.sender.undo()
+        break
+      case 'redo':
+        event.sender.redo()
+        break
+      case 'cut':
+        event.sender.cut()
+        break
+      case 'copy':
+        event.sender.copy()
+        break
+      case 'paste':
+        event.sender.paste()
+        break
+      case 'select-all':
+        event.sender.selectAll()
+        break
+      default:
+        throw new Error('不支持的编辑操作。')
+    }
+  })
+
+  ipcMain.handle('window:toggle-full-screen', (event): void => {
+    const window = BrowserWindow.fromWebContents(event.sender)
+    window?.setFullScreen(!window.isFullScreen())
+  })
+
+  ipcMain.handle('app:quit', (): void => {
+    requestCloseWithUnsavedCheck()
+  })
+
+  ipcMain.on(
+    'app:set-unsaved-file-count',
+    (event, count: number): void => {
+      unsavedFileCounts.set(
+        event.sender.id,
+        Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0
+      )
+    }
+  )
+
+  ipcMain.handle('app:confirm-close', (): void => {
+    allowApplicationClose = true
+    app.quit()
+  })
+
+  ipcMain.handle('app:get-memory-metrics', (): MemoryMetrics => {
+    return {
+      processes: app.getAppMetrics().map((metric) => ({
+        pid: metric.pid,
+        type: metric.type,
+        memoryMB: Math.round((metric.memory.workingSetSize / 1024) * 10) / 10,
+        cpuPercent: Math.round(metric.cpu.percentCPUUsage * 10) / 10
+      })),
+      totalMemoryMB: Math.round(totalmem() / 1024 / 1024),
+      freeMemoryMB: Math.round(freemem() / 1024 / 1024),
+      timestamp: new Date().toISOString()
+    }
+  })
+
+  ipcMain.handle('project:choose-parent', async (): Promise<string | null> => {
+    const focusedWindow = BrowserWindow.getFocusedWindow()
+    const options: OpenDialogOptions = {
+      title: '选择新项目保存位置',
+      buttonLabel: '选择文件夹',
+      properties: ['openDirectory', 'createDirectory']
+    }
+    const result = focusedWindow
+      ? await dialog.showOpenDialog(focusedWindow, options)
+      : await dialog.showOpenDialog(options)
+    return result.canceled ? null : result.filePaths[0] ?? null
+  })
+
+  ipcMain.handle(
+    'project:create',
+    async (_event, input: CreateProjectInput): Promise<ProjectInfo> => {
+      if (!input || typeof input !== 'object') {
+        throw new Error('项目创建参数无效。')
+      }
+      const template = PROJECT_TEMPLATES.find(
+        (item) => item.id === input.template
+      )
+      if (!template) {
+        throw new Error('所选项目模板无效。')
+      }
+      const created = await createProjectDirectory(input.parentPath, input.name)
+      await scaffoldProject(created.path, created.name, template.id)
+      if (input.initializeGit) {
+        await new Promise<void>((resolve) => {
+          execFile(
+            'git',
+            ['init', '-b', 'main'],
+            {
+              cwd: created.path,
+              windowsHide: true
+            },
+            (error) => {
+              if (error) {
+                console.warn('Unable to initialize Git repository:', error)
+              }
+              resolve()
+            }
+          )
+        })
+      }
+
+      const settings = await readProjectSettings()
+      const projectSettings: NonNullable<
+        ProjectSettingsStore['projects'][string]
+      > = {}
+      const templateCommands = projectTemplateCommands(
+        created.name,
+        template.id
+      )
+      if (templateCommands.runCommand) {
+        projectSettings.runCommand = templateCommands.runCommand
+      }
+      if (templateCommands.diagnosticsCommand) {
+        projectSettings.diagnosticsCommand =
+          templateCommands.diagnosticsCommand
+      }
+      if (Object.keys(projectSettings).length > 0) {
+        settings.projects[created.path] = projectSettings
+        await writeProjectSettings(settings)
+      }
+      return activateProject(created.path)
+    }
+  )
+
   ipcMain.handle('project:list-recent', async (): Promise<ProjectInfo[]> => {
     return readRecentProjects()
   })
 
   ipcMain.handle('project:get-current', (): ProjectInfo | null => {
     return currentProject
+  })
+
+  ipcMain.handle(
+    'project:check-availability',
+    async (): Promise<ProjectAvailability> => {
+      if (!currentProject) {
+        return { project: null, available: false }
+      }
+      try {
+        const projectStats = await stat(currentProject.path)
+        return {
+          project: currentProject,
+          available: projectStats.isDirectory()
+        }
+      } catch {
+        return { project: currentProject, available: false }
+      }
+    }
+  )
+
+  ipcMain.handle('project:close-current', async (): Promise<void> => {
+    await closeCurrentProject()
   })
 
   ipcMain.handle('project:open', async (): Promise<ProjectInfo | null> => {
@@ -1782,7 +2729,19 @@ function registerIpcHandlers(): void {
   ipcMain.handle(
     'project:open-path',
     async (_event, path: string): Promise<ProjectInfo> => {
-      return activateProject(path)
+      try {
+        return await activateProject(path)
+      } catch (error) {
+        const recentProjects = await readRecentProjects()
+        await writeRecentProjects(
+          recentProjects.filter((project) => project.path !== path)
+        )
+        const errorCode = (error as NodeJS.ErrnoException).code
+        if (errorCode === 'ENOENT' || errorCode === 'ENOTDIR') {
+          throw new Error('项目已经删除。')
+        }
+        throw error
+      }
     }
   )
 
@@ -1804,9 +2763,141 @@ function registerIpcHandlers(): void {
     }
   )
 
+  ipcMain.handle(
+    'files:create-entry',
+    async (_event, input: CreateWorkspaceEntryInput): Promise<FileEntry> => {
+      return createWorkspaceEntry(input)
+    }
+  )
+
+  ipcMain.handle(
+    'files:rename-entry',
+    async (_event, input: RenameWorkspaceEntryInput): Promise<FileEntry> => {
+      return renameWorkspaceEntry(input)
+    }
+  )
+
+  ipcMain.handle(
+    'files:trash-entry',
+    async (_event, path: string): Promise<void> => {
+      await trashWorkspaceEntry(path)
+    }
+  )
+
+  ipcMain.handle(
+    'files:delete-entry',
+    async (_event, path: string): Promise<void> => {
+      await deleteWorkspaceEntry(path)
+    }
+  )
+
+  ipcMain.handle(
+    'files:reveal-entry',
+    async (_event, path: string): Promise<void> => {
+      await revealWorkspaceEntry(path)
+    }
+  )
+
+  ipcMain.handle(
+    'files:prepare-cpp-run',
+    async (_event, path: string): Promise<CppRunPreparation> => {
+      return prepareWorkspaceCppRun(path)
+    }
+  )
+
+  ipcMain.handle(
+    'files:prepare-python-run',
+    async (_event, path: string): Promise<PythonRunPreparation> => {
+      return prepareWorkspacePythonRun(path)
+    }
+  )
+
+  ipcMain.handle(
+    'files:check-cpp-syntax',
+    async (
+      _event,
+      path: string,
+      content: string
+    ): Promise<CppSyntaxCheckResult> => {
+      return checkWorkspaceCppSyntax(path, content)
+    }
+  )
+
+  ipcMain.handle(
+    'debug:start',
+    async (
+      _event,
+      path: string,
+      breakpoints: DebugBreakpoint[]
+    ): Promise<DebuggerSnapshot> => {
+      return startWorkspaceCppDebug(path, breakpoints)
+    }
+  )
+
+  ipcMain.handle(
+    'debug:set-breakpoints',
+    async (_event, breakpoints: DebugBreakpoint[]): Promise<void> => {
+      await setWorkspaceDebugBreakpoints(breakpoints)
+    }
+  )
+
+  ipcMain.handle(
+    'debug:control',
+    async (
+      _event,
+      action:
+        | 'continue'
+        | 'pause'
+        | 'step-over'
+        | 'step-in'
+        | 'step-out'
+        | 'stop'
+    ): Promise<void> => {
+      if (action === 'stop') {
+        debugStartAbortController?.abort()
+        debugStartAbortController = null
+        debugSession?.dispose()
+        debugSession = null
+        broadcastDebuggerSnapshot({
+          ...idleDebugSnapshot,
+          message: '调试已取消。'
+        })
+        return
+      }
+      if (!debugSession) {
+        throw new Error('没有活动调试会话。')
+      }
+      await debugSession.control(action)
+    }
+  )
+
+  ipcMain.handle(
+    'debug:evaluate',
+    async (_event, expression: string): Promise<string> => {
+      if (!debugSession) {
+        throw new Error('没有活动调试会话。')
+      }
+      if (typeof expression !== 'string' || expression.length > 4000) {
+        throw new Error('调试表达式无效。')
+      }
+      return debugSession.evaluate(expression)
+    }
+  )
+
+  ipcMain.handle('debug:snapshot', (): DebuggerSnapshot => {
+    return debugSession?.getSnapshot() ?? idleDebugSnapshot
+  })
+
   ipcMain.handle('git:get-status', async (): Promise<GitStatus> => {
     return getGitStatus()
   })
+
+  ipcMain.handle(
+    'git:ensure-recommended-ignore',
+    async (): Promise<GitignoreRepairResult> => {
+      return ensureRecommendedGitignore(ensureCurrentProject().path)
+    }
+  )
 
   ipcMain.handle(
     'git:get-file-diff',
@@ -1929,6 +3020,24 @@ function registerIpcHandlers(): void {
     'agent:provider-status',
     async (): Promise<AgentProviderStatus> => {
       return getAgentProviderStatus()
+    }
+  )
+
+  ipcMain.handle(
+    'agent:code-completion',
+    async (
+      event,
+      request: AgentCodeCompletionRequest
+    ): Promise<AgentCodeCompletionResult> => {
+      return getAgentCodeCompletion(event.sender.id, request)
+    }
+  )
+
+  ipcMain.handle(
+    'agent:cancel-code-completion',
+    async (event): Promise<void> => {
+      agentCompletionControllers.get(event.sender.id)?.abort()
+      agentCompletionControllers.delete(event.sender.id)
     }
   )
 
@@ -2103,6 +3212,7 @@ function registerIpcHandlers(): void {
 app.whenReady().then(async () => {
   app.setAppUserModelId('com.local.ai-ide')
   registerIpcHandlers()
+  createApplicationMenu()
 
   const startupProjectPath = process.env.AI_IDE_PROJECT
   if (startupProjectPath) {
@@ -2129,14 +3239,41 @@ app.whenReady().then(async () => {
 app.on('window-all-closed', () => {
   terminalService.killAll()
   agentCoordinator.killAll()
+  for (const controller of agentCompletionControllers.values()) {
+    controller.abort()
+  }
+  agentCompletionControllers.clear()
   if (process.platform !== 'darwin') {
     app.quit()
   }
 })
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
+  if (
+    !allowApplicationClose &&
+    [...unsavedFileCounts.values()].some((count) => count > 0)
+  ) {
+    event.preventDefault()
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (
+        !window.isDestroyed() &&
+        (unsavedFileCounts.get(window.webContents.id) ?? 0) > 0
+      ) {
+        sendCloseRequest(window)
+      }
+    }
+    return
+  }
+  if (closeCleanupComplete) {
+    return
+  }
+  closeCleanupComplete = true
   terminalService.killAll()
   agentCoordinator.killAll()
+  debugStartAbortController?.abort()
+  debugStartAbortController = null
+  debugSession?.dispose()
+  debugSession = null
   persistenceDatabase?.close()
   persistenceDatabase = null
 })

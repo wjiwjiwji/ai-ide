@@ -22,14 +22,77 @@ const desktopApi: DesktopApi = {
     ipcRenderer.on('updates:status', listener)
     return () => ipcRenderer.removeListener('updates:status', listener)
   },
+  onAppMenuCommand: (callback) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      command: Parameters<typeof callback>[0]
+    ): void => {
+      callback(command)
+    }
+    ipcRenderer.on('app-menu:command', listener)
+    return () => ipcRenderer.removeListener('app-menu:command', listener)
+  },
+  onCloseRequested: (callback) => {
+    const listener = (): void => callback()
+    ipcRenderer.on('app:close-requested', listener)
+    return () => ipcRenderer.removeListener('app:close-requested', listener)
+  },
+  performEditAction: (action) => ipcRenderer.invoke('edit:perform', action),
+  toggleFullScreen: () => ipcRenderer.invoke('window:toggle-full-screen'),
+  quitApp: () => ipcRenderer.invoke('app:quit'),
+  confirmClose: () => ipcRenderer.invoke('app:confirm-close'),
+  setUnsavedFileCount: (count) =>
+    ipcRenderer.send('app:set-unsaved-file-count', count),
+  chooseProjectParent: () => ipcRenderer.invoke('project:choose-parent'),
+  createProject: (input) => ipcRenderer.invoke('project:create', input),
   openProject: () => ipcRenderer.invoke('project:open'),
   openRecentProject: (path) => ipcRenderer.invoke('project:open-path', path),
   listRecentProjects: () => ipcRenderer.invoke('project:list-recent'),
   getCurrentProject: () => ipcRenderer.invoke('project:get-current'),
+  checkProjectAvailability: () =>
+    ipcRenderer.invoke('project:check-availability'),
+  closeCurrentProject: () => ipcRenderer.invoke('project:close-current'),
   getFileTree: () => ipcRenderer.invoke('files:get-tree'),
   readFile: (path) => ipcRenderer.invoke('files:read', path),
   saveFile: (path, content) => ipcRenderer.invoke('files:save', path, content),
+  createWorkspaceEntry: (input) =>
+    ipcRenderer.invoke('files:create-entry', input),
+  renameWorkspaceEntry: (input) =>
+    ipcRenderer.invoke('files:rename-entry', input),
+  trashWorkspaceEntry: (path) =>
+    ipcRenderer.invoke('files:trash-entry', path),
+  deleteWorkspaceEntry: (path) =>
+    ipcRenderer.invoke('files:delete-entry', path),
+  revealWorkspaceEntry: (path) =>
+    ipcRenderer.invoke('files:reveal-entry', path),
+  getMemoryMetrics: () => ipcRenderer.invoke('app:get-memory-metrics'),
+  prepareCppRun: (path) =>
+    ipcRenderer.invoke('files:prepare-cpp-run', path),
+  preparePythonRun: (path) =>
+    ipcRenderer.invoke('files:prepare-python-run', path),
+  checkCppSyntax: (path, content) =>
+    ipcRenderer.invoke('files:check-cpp-syntax', path, content),
+  startCppDebug: (path, breakpoints) =>
+    ipcRenderer.invoke('debug:start', path, breakpoints),
+  setDebugBreakpoints: (breakpoints) =>
+    ipcRenderer.invoke('debug:set-breakpoints', breakpoints),
+  debugControl: (action) => ipcRenderer.invoke('debug:control', action),
+  evaluateDebugExpression: (expression) =>
+    ipcRenderer.invoke('debug:evaluate', expression),
+  getDebuggerSnapshot: () => ipcRenderer.invoke('debug:snapshot'),
+  onDebuggerSnapshot: (callback) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      snapshot: Parameters<typeof callback>[0]
+    ): void => {
+      callback(snapshot)
+    }
+    ipcRenderer.on('debug:snapshot', listener)
+    return () => ipcRenderer.removeListener('debug:snapshot', listener)
+  },
   getGitStatus: () => ipcRenderer.invoke('git:get-status'),
+  ensureRecommendedGitignore: () =>
+    ipcRenderer.invoke('git:ensure-recommended-ignore'),
   getGitFileDiff: (path, originalPath) =>
     ipcRenderer.invoke('git:get-file-diff', path, originalPath),
   stageFiles: (paths) => ipcRenderer.invoke('git:stage-files', paths),
@@ -76,6 +139,10 @@ const desktopApi: DesktopApi = {
   saveDeepSeekApiKey: (apiKey) =>
     ipcRenderer.invoke('agent:save-deepseek-key', apiKey),
   clearDeepSeekApiKey: () => ipcRenderer.invoke('agent:clear-deepseek-key'),
+  getAgentCodeCompletion: (request) =>
+    ipcRenderer.invoke('agent:code-completion', request),
+  cancelAgentCodeCompletion: () =>
+    ipcRenderer.invoke('agent:cancel-code-completion'),
   respondAgentApproval: (runId, approvalId, approved) =>
     ipcRenderer.invoke(
       'agent:approval-response',

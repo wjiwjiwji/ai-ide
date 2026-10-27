@@ -9,6 +9,7 @@ interface TerminalPanelProps {
   visible: boolean
   runCommand: string
   runRequest: number
+  externalRunRequest: { id: number; command: string } | null
   onRunCommandChange: (command: string) => void
   onSaveRunCommand: (command: string) => Promise<void>
 }
@@ -20,6 +21,7 @@ function TerminalPanel({
   visible,
   runCommand,
   runRequest,
+  externalRunRequest,
   onRunCommandChange,
   onSaveRunCommand
 }: TerminalPanelProps): React.JSX.Element {
@@ -32,6 +34,7 @@ function TerminalPanel({
   const [restartToken, setRestartToken] = useState(0)
   const [error, setError] = useState('')
   const lastRunRequestRef = useRef(0)
+  const lastExternalRunRequestRef = useRef(0)
   const pendingRunRequestRef = useRef(false)
 
   useEffect(() => {
@@ -218,6 +221,29 @@ function TerminalPanel({
       void runCurrentCommand()
     }
   }, [runCommand, runRequest, status, visible])
+
+  useEffect(() => {
+    const sessionId = sessionIdRef.current
+    if (
+      !externalRunRequest ||
+      externalRunRequest.id <= lastExternalRunRequestRef.current ||
+      !visible ||
+      status !== 'running' ||
+      !sessionId
+    ) {
+      return
+    }
+
+    lastExternalRunRequestRef.current = externalRunRequest.id
+    void window.desktop
+      .writeTerminal(sessionId, `${externalRunRequest.command}\r`)
+      .then(() => terminalRef.current?.focus())
+      .catch((runError) => {
+        setError(
+          runError instanceof Error ? runError.message : '无法运行当前文件。'
+        )
+      })
+  }, [externalRunRequest, status, visible])
 
   return (
     <div className="terminal-panel">

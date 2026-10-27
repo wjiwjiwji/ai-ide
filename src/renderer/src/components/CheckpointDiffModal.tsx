@@ -7,6 +7,7 @@ import type {
 
 interface CheckpointDiffModalProps {
   checkpointId: string
+  theme: string
   onClose: () => void
 }
 
@@ -35,6 +36,7 @@ function languageForPath(path: string): string {
 
 function CheckpointDiffModal({
   checkpointId,
+  theme,
   onClose
 }: CheckpointDiffModalProps): React.JSX.Element {
   const [diff, setDiff] = useState<CheckpointDiff | null>(null)
@@ -96,7 +98,7 @@ function CheckpointDiffModal({
       >
         <header className="checkpoint-diff-header">
           <div>
-            <span className="eyebrow">Checkpoint diff</span>
+            <span className="eyebrow">检查点差异</span>
             <strong>{diff?.label ?? '检查点差异'}</strong>
           </div>
           <div className="checkpoint-diff-stats">
@@ -155,7 +157,7 @@ function CheckpointDiffModal({
                 original={fileDiff.originalContent}
                 modified={fileDiff.modifiedContent}
                 language={languageForPath(fileDiff.path)}
-                theme="vs-dark"
+                theme={theme}
                 options={{
                   automaticLayout: true,
                   readOnly: true,

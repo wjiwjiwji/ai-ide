@@ -1,6 +1,6 @@
 {
   "name": "ai-ide",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "author": "AI IDE",
   "description": "A personal AI-native project workspace.",
@@ -11,6 +11,7 @@
     "pack:win": "npm run build && electron-builder --win --dir",
     "dist:win": "npm run build && electron-builder --win nsis --x64",
     "release:win": "npm run build && electron-builder --win nsis --x64 --publish always",
+    "debugger:setup": "powershell -ExecutionPolicy Bypass -File native/install-cpptools-debugger.ps1; powershell -ExecutionPolicy Bypass -File native/install-msys2-debugger.ps1",
     "preview": "electron-vite preview",
     "check": "npm run typecheck && npm test",
     "test": "vitest run",

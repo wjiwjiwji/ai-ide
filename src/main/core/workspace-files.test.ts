@@ -1,6 +1,7 @@
 import {
   mkdtemp,
   mkdir,
+  readFile,
   rm,
   writeFile
 } from 'node:fs/promises'
@@ -74,5 +75,95 @@ describe('workspace file service', () => {
     const tree = await service.getDirectoryTree('.', 1)
 
     expect(tree).toHaveLength(1)
+  })
+
+  it('creates files and directories and rejects duplicate names', async () => {
+    const root = await createWorkspace()
+    const service = new WorkspaceFileService(root)
+
+    const file = await service.createEntry(
+      'src',
+      'file',
+      'new-file.ts',
+      'export const created = true\n'
+    )
+    const directory = await service.createEntry(
+      '',
+      'directory',
+      'new-folder'
+    )
+
+    expect(file).toMatchObject({
+      name: 'new-file.ts',
+      type: 'file'
+    })
+    expect(directory).toMatchObject({
+      name: 'new-folder',
+      type: 'directory'
+    })
+    expect(
+      await readFile(join(root, 'src', 'new-file.ts'), 'utf8')
+    ).toBe('export const created = true\n')
+    await service.createEntry(
+      join('src', 'Headers'),
+      'file',
+      'Student.h',
+      '#pragma once\n',
+      true
+    )
+    expect(
+      await readFile(join(root, 'src', 'Headers', 'Student.h'), 'utf8')
+    ).toBe('#pragma once\n')
+    await expect(
+      service.createEntry('src', 'file', 'new-file.ts')
+    ).rejects.toThrow('同名文件或文件夹已经存在')
+  })
+
+  it('rejects traversal and unsafe entry names', async () => {
+    const root = await createWorkspace()
+    const service = new WorkspaceFileService(root)
+
+    await expect(
+      service.createEntry('../outside', 'file', 'test.ts')
+    ).rejects.toThrow('拒绝访问当前项目目录之外的文件')
+    await expect(
+      service.createEntry('src', 'file', '../outside.ts')
+    ).rejects.toThrow('名称不能包含')
+    await expect(
+      service.createEntry('src', 'directory', 'CON')
+    ).rejects.toThrow('Windows 保留名称')
+  })
+
+  it('renames files and directories without allowing overwrites', async () => {
+    const root = await createWorkspace()
+    const service = new WorkspaceFileService(root)
+
+    const renamedFile = await service.renameEntry(
+      join('src', 'app.ts'),
+      'main.ts'
+    )
+    const renamedDirectory = await service.renameEntry('src', 'source')
+
+    expect(renamedFile).toMatchObject({ name: 'main.ts', type: 'file' })
+    expect(renamedDirectory).toMatchObject({
+      name: 'source',
+      type: 'directory'
+    })
+    await expect(
+      service.renameEntry('README.md', 'source')
+    ).rejects.toThrow('同名文件或文件夹已经存在')
+  })
+
+  it('permanently deletes a selected entry but protects the project root', async () => {
+    const root = await createWorkspace()
+    const service = new WorkspaceFileService(root)
+
+    await service.deleteEntry(join('src', 'app.ts'))
+    expect((await service.getFileTree()).some((entry) => entry.name === 'src')).toBe(
+      true
+    )
+    await expect(service.deleteEntry('.')).rejects.toThrow(
+      '不能删除项目根目录'
+    )
   })
 })

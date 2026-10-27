@@ -13,6 +13,12 @@ asar: true
 asarUnpack:
   - node_modules/node-pty/**/*
 
+extraResources:
+  - from: .debugger/cpptools-win/extension/debugAdapters/bin
+    to: debug-adapters/cpptools/bin
+  - from: .debugger/msys2/ucrt64
+    to: debug-adapters/gdb
+
 # node-pty ships Node-API prebuilds. They do not need an Electron-specific ABI rebuild.
 npmRebuild: false
 

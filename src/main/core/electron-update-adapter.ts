@@ -1,3 +1,4 @@
+import { app } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import type {
   UpdateAdapter,
@@ -38,5 +39,18 @@ export function createElectronUpdateAdapter(): UpdateAdapter {
         autoUpdater.quitAndInstall(false, true)
       })
     }
+  }
+}
+
+export function configureUpdateNetwork(): void {
+  const proxyRules = process.env.AI_IDE_UPDATER_PROXY?.trim()
+  if (proxyRules) {
+    app.commandLine.appendSwitch('proxy-server', proxyRules)
+    return
+  }
+  if (process.env.AI_IDE_UPDATER_USE_SYSTEM_PROXY !== '1') {
+    // Chromium can keep using a stale system proxy after it has been disabled.
+    // Match the default standalone setup while retaining an explicit opt-in.
+    app.commandLine.appendSwitch('no-proxy-server')
   }
 }

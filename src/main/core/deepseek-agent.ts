@@ -254,7 +254,7 @@ async function searchText(
           typeof (error as { code?: number }).code === 'number' &&
           (error as { code: number }).code === 1
         ) {
-          resolveSearch('No matches found.')
+          resolveSearch('未找到匹配内容。')
           return
         }
         if (error) {
@@ -460,7 +460,7 @@ async function executeTool(
     }
   }
 
-  throw new Error(`Unknown tool: ${toolName}`)
+  throw new Error(`未知工具：${toolName}`)
 }
 
 export async function runDeepSeekAgent(
@@ -558,7 +558,7 @@ export async function runDeepSeekAgent(
         })
       } catch (toolError) {
         const message =
-          toolError instanceof Error ? toolError.message : 'Tool failed.'
+          toolError instanceof Error ? toolError.message : '工具执行失败。'
         options.emit({
           type: 'item.completed',
           item: {

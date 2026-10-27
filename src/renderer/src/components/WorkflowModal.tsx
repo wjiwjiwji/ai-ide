@@ -353,7 +353,7 @@ function WorkflowModal({
       >
         <header className="workflow-modal-header">
           <div>
-            <span className="eyebrow">Project automation</span>
+            <span className="eyebrow">项目自动化</span>
             <h2>项目工作流</h2>
           </div>
           <div className="workflow-header-actions">
@@ -794,7 +794,7 @@ function WorkflowModal({
                       <span>{step.status}</span>
                       {step.label}
                     </summary>
-                    <pre>{step.output || 'No output.'}</pre>
+                    <pre>{step.output || '没有输出。'}</pre>
                   </details>
                 ))}
               </div>

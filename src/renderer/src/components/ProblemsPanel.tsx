@@ -7,6 +7,7 @@ import type {
 interface ProblemsPanelProps {
   visible: boolean
   refreshToken: number
+  externalDiagnostics?: ProjectDiagnostic[]
   onCountChange: (count: number) => void
   onOpenDiagnostic: (diagnostic: ProjectDiagnostic) => void
   onAskAgent: (diagnostics: ProjectDiagnostic[]) => void
@@ -15,6 +16,7 @@ interface ProblemsPanelProps {
 function ProblemsPanel({
   visible,
   refreshToken,
+  externalDiagnostics = [],
   onCountChange,
   onOpenDiagnostic,
   onAskAgent
@@ -61,8 +63,8 @@ function ProblemsPanel({
   }, [refreshToken, runDiagnostics, visible])
 
   useEffect(() => {
-    onCountChange(result?.items.length ?? 0)
-  }, [onCountChange, result?.items.length])
+    onCountChange((result?.items.length ?? 0) + externalDiagnostics.length)
+  }, [externalDiagnostics.length, onCountChange, result?.items.length])
 
   const saveCommand = async (): Promise<void> => {
     if (!window.desktop) {
@@ -81,16 +83,20 @@ function ProblemsPanel({
     }
   }
 
-  const errors =
-    result?.items.filter((item) => item.severity === 'error').length ?? 0
-  const warnings =
-    result?.items.filter((item) => item.severity === 'warning').length ?? 0
+  const allItems = [
+    ...externalDiagnostics,
+    ...(result?.items ?? [])
+  ]
+  const errors = allItems.filter((item) => item.severity === 'error').length
+  const warnings = allItems.filter(
+    (item) => item.severity === 'warning'
+  ).length
 
   return (
     <div className="problems-panel">
       <div className="problems-summary">
         <div>
-          <span className="eyebrow">Diagnostics</span>
+          <span className="eyebrow">诊断</span>
           <strong>
             {errors} 错误 · {warnings} 警告
           </strong>
@@ -152,13 +158,13 @@ function ProblemsPanel({
           <strong>诊断命令执行失败</strong>
           <p>{result.error}</p>
         </div>
-      ) : result?.items.length ? (
+      ) : allItems.length ? (
         <>
           <div className="problems-list">
-            {result.items.map((diagnostic) => (
+            {allItems.map((diagnostic, index) => (
               <div
                 className={`problem-row ${diagnostic.severity}`}
-                key={`${diagnostic.file}:${diagnostic.line}:${diagnostic.column}:${diagnostic.code ?? ''}:${diagnostic.message}`}
+                key={`${diagnostic.file}:${diagnostic.line}:${diagnostic.column}:${diagnostic.code ?? ''}:${diagnostic.message}:${index}`}
               >
                 <button
                   className="problem-main"
@@ -193,8 +199,8 @@ function ProblemsPanel({
             ))}
           </div>
           <div className="problems-footer">
-            <span>{result.items.length} 个问题</span>
-            <button type="button" onClick={() => onAskAgent(result.items)}>
+            <span>{allItems.length} 个问题</span>
+            <button type="button" onClick={() => onAskAgent(allItems)}>
               让 Agent 修复
             </button>
           </div>

@@ -1,12 +1,15 @@
 import {
   lstat,
+  mkdir,
   readFile,
   readdir,
   realpath,
+  rename,
+  rm,
   stat,
   writeFile
 } from 'node:fs/promises'
-import { join, relative, resolve } from 'node:path'
+import { dirname, join, relative, resolve } from 'node:path'
 import type { FileContent, FileEntry } from '../../shared/desktop'
 import { assertPathInside } from './path-security'
 
@@ -29,6 +32,35 @@ export interface WorkspaceFileOptions {
   maxFileSize?: number
   maxEntries?: number
   ignoredDirectories?: Set<string>
+}
+
+const windowsReservedName =
+  /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i
+
+export function normalizeWorkspaceEntryName(name: string): string {
+  if (typeof name !== 'string') {
+    throw new Error('名称无效。')
+  }
+  const normalized = name.trim()
+  if (!normalized) {
+    throw new Error('请输入文件或文件夹名称。')
+  }
+  if (normalized.length > 255) {
+    throw new Error('名称不能超过 255 个字符。')
+  }
+  if (normalized === '.' || normalized === '..') {
+    throw new Error('名称无效。')
+  }
+  if (/[<>:"/\\|?*\u0000-\u001f]/.test(normalized)) {
+    throw new Error('名称不能包含 < > : " / \\ | ? * 等字符。')
+  }
+  if (/[. ]$/.test(normalized)) {
+    throw new Error('名称不能以句点或空格结尾。')
+  }
+  if (windowsReservedName.test(normalized)) {
+    throw new Error('该名称是 Windows 保留名称。')
+  }
+  return normalized
 }
 
 export async function buildFileTree(
@@ -194,5 +226,116 @@ export class WorkspaceFileService {
       throw new Error('所选路径不是文件。')
     }
     await writeFile(realTargetPath, content, 'utf8')
+  }
+
+  async createEntry(
+    directoryPath: string,
+    type: 'file' | 'directory',
+    name: string,
+    content = '',
+    createParentDirectories = false
+  ): Promise<FileEntry> {
+    if (type !== 'file' && type !== 'directory') {
+      throw new Error('创建类型无效。')
+    }
+    const normalizedName = normalizeWorkspaceEntryName(name)
+    if (typeof content !== 'string') {
+      throw new Error('文件初始内容无效。')
+    }
+    if (Buffer.byteLength(content, 'utf8') > this.maxFileSize) {
+      throw new Error('文件超过 2 MB，当前编辑器暂不支持创建。')
+    }
+    const projectRoot = await this.getRoot()
+    const requestedDirectory = directoryPath
+      ? resolve(projectRoot, directoryPath)
+      : projectRoot
+    assertPathInside(projectRoot, requestedDirectory)
+    if (createParentDirectories) {
+      await mkdir(requestedDirectory, { recursive: true })
+    }
+    const directoryRoot = await realpath(requestedDirectory)
+    assertPathInside(projectRoot, directoryRoot)
+    const directoryStats = await lstat(directoryRoot)
+    if (!directoryStats.isDirectory()) {
+      throw new Error('只能在文件夹中创建内容。')
+    }
+
+    const targetPath = join(directoryRoot, normalizedName)
+    try {
+      await lstat(targetPath)
+      throw new Error('同名文件或文件夹已经存在。')
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message === '同名文件或文件夹已经存在。'
+      ) {
+        throw error
+      }
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error
+      }
+    }
+
+    if (type === 'directory') {
+      await mkdir(targetPath)
+    } else {
+      await writeFile(targetPath, content, {
+        encoding: 'utf8',
+        flag: 'wx'
+      })
+    }
+
+    return {
+      name: normalizedName,
+      path: relative(projectRoot, targetPath),
+      type
+    }
+  }
+
+  async renameEntry(relativePath: string, newName: string): Promise<FileEntry> {
+    const normalizedName = normalizeWorkspaceEntryName(newName)
+    const { projectRoot, targetPath } = await this.resolvePath(relativePath)
+    const realTargetPath = await realpath(targetPath)
+    assertPathInside(projectRoot, realTargetPath)
+    if (realTargetPath === projectRoot) {
+      throw new Error('不能重命名项目根目录。')
+    }
+    const entryStats = await lstat(realTargetPath)
+    const nextPath = join(dirname(realTargetPath), normalizedName)
+    try {
+      await lstat(nextPath)
+      throw new Error('同名文件或文件夹已经存在。')
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message === '同名文件或文件夹已经存在。'
+      ) {
+        throw error
+      }
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error
+      }
+    }
+
+    await rename(realTargetPath, nextPath)
+    return {
+      name: normalizedName,
+      path: relative(projectRoot, nextPath),
+      type: entryStats.isDirectory() ? 'directory' : 'file'
+    }
+  }
+
+  async deleteEntry(relativePath: string): Promise<void> {
+    const { projectRoot, targetPath } = await this.resolvePath(relativePath)
+    const realTargetPath = await realpath(targetPath)
+    assertPathInside(projectRoot, realTargetPath)
+    if (realTargetPath === projectRoot) {
+      throw new Error('不能删除项目根目录。')
+    }
+    await rm(realTargetPath, {
+      recursive: true,
+      force: false,
+      maxRetries: 2
+    })
   }
 }

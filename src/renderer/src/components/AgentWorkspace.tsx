@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   AgentCheckpointInfo,
   AgentProvider,
@@ -10,15 +10,29 @@ import type {
   AgentTaskSummary,
   CodeIndexStatus,
   CodeSearchResult,
+  GitFileChange,
   ProjectInfo
 } from '../../../shared/desktop'
 import CheckpointDiffModal from './CheckpointDiffModal'
+import FloatingDetailWindow from './FloatingDetailWindow'
+import MarkdownContent from './MarkdownContent'
+import {
+  buildAgentPrompt,
+  type AgentEditorFocus
+} from '../agent-focus'
 
 interface AgentWorkspaceProps {
   project: ProjectInfo
   visible: boolean
+  editorTheme: string
   hasUnsavedFiles: boolean
+  workspaceFocus: AgentEditorFocus | null
+  openFilePaths: string[]
+  changedFilePaths: string[]
+  diagnosticFilePaths: string[]
+  gitChanges: GitFileChange[]
   onRunFinished: () => Promise<void>
+  onOpenFile: (path: string) => void
   externalPrompt: {
     id: string
     text: string
@@ -35,6 +49,7 @@ type ChatEntry =
       kind: 'user' | 'assistant' | 'system' | 'error'
       text: string
       contextFiles?: string[]
+      autoFocusFiles?: string[]
     }
   | {
       id: string
@@ -74,7 +89,8 @@ function toStoredEntry(entry: ChatEntry): AgentTaskEntry {
     id: entry.id,
     kind: entry.kind,
     text: entry.text,
-    contextFiles: entry.contextFiles
+    contextFiles: entry.contextFiles,
+    autoFocusFiles: entry.autoFocusFiles
   }
 }
 
@@ -96,7 +112,8 @@ function fromStoredEntry(entry: AgentTaskEntry): ChatEntry {
     id: entry.id,
     kind: entry.kind,
     text: entry.text ?? '',
-    contextFiles: entry.contextFiles
+    contextFiles: entry.contextFiles,
+    autoFocusFiles: entry.autoFocusFiles
   }
 }
 
@@ -117,11 +134,53 @@ function toolTitle(type: string | undefined): string {
   }
 }
 
+function toolStatusLabel(status: string): string {
+  switch (status) {
+    case 'running':
+      return '运行中'
+    case 'completed':
+      return '已完成'
+    case 'failed':
+      return '失败'
+    case 'approved':
+      return '已允许'
+    case 'rejected':
+      return '已拒绝'
+    case 'pending':
+      return '等待确认'
+    default:
+      return status
+  }
+}
+
+function fileChangeLabel(kind: GitFileChange['kind']): string {
+  switch (kind) {
+    case 'added':
+    case 'untracked':
+      return '新增'
+    case 'deleted':
+      return '删除'
+    case 'renamed':
+      return '重命名'
+    case 'conflicted':
+      return '冲突'
+    default:
+      return '修改'
+  }
+}
+
 function AgentWorkspace({
   project,
   visible,
+  editorTheme,
   hasUnsavedFiles,
+  workspaceFocus,
+  openFilePaths,
+  changedFilePaths,
+  diagnosticFilePaths,
+  gitChanges,
   onRunFinished,
+  onOpenFile,
   externalPrompt
 }: AgentWorkspaceProps): React.JSX.Element {
   const [entries, setEntries] = useState<ChatEntry[]>([])
@@ -139,6 +198,7 @@ function AgentWorkspace({
   const [taskList, setTaskList] = useState<AgentTaskSummary[]>([])
   const [checkpoints, setCheckpoints] = useState<AgentCheckpointInfo[]>([])
   const [showCheckpoints, setShowCheckpoints] = useState(false)
+  const [showChanges, setShowChanges] = useState(false)
   const [diffCheckpointId, setDiffCheckpointId] = useState<string | null>(null)
   const [taskLoading, setTaskLoading] = useState(false)
   const [contextFiles, setContextFiles] = useState<string[]>([])
@@ -159,6 +219,52 @@ function AgentWorkspace({
     provider === 'deepseek'
       ? providerStatus?.deepseekConfigured === true
       : providerStatus?.codexAvailable !== false
+  const autoFocusFiles = useMemo(
+    () => [
+      ...new Set(
+        [
+          workspaceFocus?.path,
+          ...openFilePaths,
+          ...changedFilePaths,
+          ...diagnosticFilePaths
+        ].filter((path): path is string => Boolean(path))
+      )
+    ].slice(0, 30),
+    [
+      changedFilePaths,
+      diagnosticFilePaths,
+      openFilePaths,
+      workspaceFocus?.path
+    ]
+  )
+  const agentChangedFiles = useMemo(() => {
+    const paths = [
+      ...new Set(
+        entries.flatMap((entry) =>
+          entry.kind === 'tool' ? entry.changes : []
+        )
+      )
+    ]
+    return paths.map((path) => {
+      const normalized = path.replaceAll('\\', '/').toLowerCase()
+      const gitChange = gitChanges.find((change) => {
+        const candidate = (change.path || change.originalPath || '')
+          .replaceAll('\\', '/')
+          .toLowerCase()
+        return candidate === normalized
+      })
+      return {
+        path,
+        kind: gitChange?.kind ?? 'modified'
+      }
+    })
+  }, [entries, gitChanges])
+
+  useEffect(() => {
+    if (!agentChangedFiles.length) {
+      setShowChanges(false)
+    }
+  }, [agentChangedFiles.length])
 
   useEffect(() => {
     if (!window.desktop) {
@@ -646,39 +752,6 @@ function AgentWorkspace({
     }
   }
 
-  const buildPrompt = (request: string): string => {
-    const history = entries
-      .flatMap((entry) => {
-        if (entry.kind !== 'user' && entry.kind !== 'assistant') {
-          return []
-        }
-        const role = entry.kind === 'user' ? 'User' : 'Assistant'
-        return [`${role}: ${entry.text.slice(0, 3000)}`]
-      })
-      .slice(-8)
-
-    if (history.length === 0 && contextFiles.length === 0) {
-      return request
-    }
-
-    return [
-      'Continue this AI IDE task in the current project.',
-      ...(contextFiles.length
-        ? [
-            '',
-            'Relevant files selected by the user:',
-            ...contextFiles.map((path) => `- ${path}`)
-          ]
-        : []),
-      '',
-      'Previous conversation:',
-      ...history,
-      '',
-      'Current request:',
-      request
-    ].join('\n')
-  }
-
   const startRun = async (): Promise<void> => {
     const request = draft.trim()
     if (!request || status !== 'idle' || !window.desktop) {
@@ -717,7 +790,8 @@ function AgentWorkspace({
       id: crypto.randomUUID(),
       kind: 'user',
       text: request,
-      contextFiles: [...contextFiles]
+      contextFiles: [...contextFiles],
+      autoFocusFiles: [...autoFocusFiles]
     }
     const nextTaskId = taskId ?? crypto.randomUUID()
     const nextTaskTitle =
@@ -749,8 +823,25 @@ function AgentWorkspace({
       setThreadId(null)
       await refreshTaskList()
 
+      const history = entries
+        .flatMap((entry) => {
+          if (entry.kind !== 'user' && entry.kind !== 'assistant') {
+            return []
+          }
+          const role = entry.kind === 'user' ? 'User' : 'Assistant'
+          return [`${role}: ${entry.text.slice(0, 3000)}`]
+        })
+        .slice(-8)
       const run = await window.desktop.startAgent(
-        buildPrompt(request),
+        buildAgentPrompt({
+          request,
+          history,
+          contextFiles,
+          workspaceFocus,
+          openFilePaths,
+          changedFilePaths,
+          diagnosticFilePaths
+        }),
         mode,
         provider,
         nextTaskId
@@ -856,7 +947,7 @@ function AgentWorkspace({
     <section className="agent-workspace">
       <header className="agent-header">
         <div>
-          <span className="eyebrow">Agent session</span>
+          <span className="eyebrow">Agent 会话</span>
           <strong>{taskTitle === '新任务' ? project.name : taskTitle}</strong>
         </div>
         <div className="agent-header-actions">
@@ -916,6 +1007,14 @@ function AgentWorkspace({
           </select>
         </div>
         <button
+          className={showChanges ? 'active' : ''}
+          type="button"
+          disabled={!agentChangedFiles.length}
+          onClick={() => setShowChanges((current) => !current)}
+        >
+          本轮变更 {agentChangedFiles.length}
+        </button>
+        <button
           className={showCheckpoints ? 'active' : ''}
           type="button"
           disabled={!taskId}
@@ -974,7 +1073,7 @@ function AgentWorkspace({
             </div>
             <span className="welcome-kicker">
               <span className="kicker-line" />
-              READY TO WORK
+              准备就绪
             </span>
             <h1>把目标交给 Agent。</h1>
             <p>
@@ -1009,13 +1108,20 @@ function AgentWorkspace({
                   <article className={`agent-tool-card ${entry.status}`} key={entry.id}>
                     <div className="agent-tool-heading">
                       <span>{entry.title}</span>
-                      <small>{entry.status}</small>
+                      <small>{toolStatusLabel(entry.status)}</small>
                     </div>
                     <pre>{entry.detail}</pre>
                     {entry.changes.length ? (
                       <div className="agent-tool-changes">
                         {entry.changes.map((path) => (
-                          <span key={path}>{path}</span>
+                          <button
+                            type="button"
+                            key={path}
+                            title={`打开 ${path}`}
+                            onClick={() => onOpenFile(path)}
+                          >
+                            {path}
+                          </button>
                         ))}
                       </div>
                     ) : null}
@@ -1065,12 +1171,39 @@ function AgentWorkspace({
                           : '系统'}
                   </div>
                   <div className="agent-entry-copy">
-                    {entry.text}
-                    {entry.kind === 'user' && entry.contextFiles?.length ? (
+                    {entry.kind === 'assistant' ? (
+                      <MarkdownContent text={entry.text} />
+                    ) : (
+                      entry.text
+                    )}
+                    {entry.kind === 'user' &&
+                    (entry.contextFiles?.length || entry.autoFocusFiles?.length) ? (
                       <div className="agent-context-tags">
-                        {entry.contextFiles.map((path) => (
-                          <span key={path}>{path}</span>
+                        {entry.autoFocusFiles?.slice(0, 8).map((path) => (
+                          <button
+                            className="automatic"
+                            type="button"
+                            key={`focus-${path}`}
+                            title={`自动焦点：${path}`}
+                            onClick={() => onOpenFile(path)}
+                          >
+                            {path}
+                          </button>
                         ))}
+                        {entry.contextFiles
+                          ?.filter(
+                            (path) => !entry.autoFocusFiles?.includes(path)
+                          )
+                          .map((path) => (
+                          <button
+                            type="button"
+                            key={`pinned-${path}`}
+                            title={`固定关注：${path}`}
+                            onClick={() => onOpenFile(path)}
+                          >
+                            {path}
+                          </button>
+                          ))}
                       </div>
                     ) : null}
                   </div>
@@ -1093,6 +1226,29 @@ function AgentWorkspace({
       </div>
 
       <div className="agent-composer">
+        <div className="agent-workspace-focus">
+          <span>
+            <strong>项目范围</strong>
+            整个项目
+          </span>
+          {workspaceFocus ? (
+            <button
+              type="button"
+              title={
+                workspaceFocus.selectedText
+                  ? '当前编辑器和代码选区已自动加入工作焦点'
+                  : '当前编辑器已自动加入工作焦点'
+              }
+              onClick={() => onOpenFile(workspaceFocus.path)}
+            >
+              <strong>当前焦点</strong>
+              {workspaceFocus.path}:{workspaceFocus.startLine}
+              {workspaceFocus.selectedText ? ' · 有选区' : ''}
+            </button>
+          ) : (
+            <span>当前没有打开的文件</span>
+          )}
+        </div>
         <div className="agent-mode-row">
           <div className="agent-mode-switch" role="radiogroup" aria-label="Agent 权限">
             <button
@@ -1187,8 +1343,15 @@ function AgentWorkspace({
           <div className="agent-selected-context">
             {contextFiles.map((path) => (
               <span key={path}>
-                {path}
                 <button
+                  className="context-open"
+                  type="button"
+                  onClick={() => onOpenFile(path)}
+                >
+                  {path}
+                </button>
+                <button
+                  className="context-remove"
                   type="button"
                   aria-label={`移除 ${path}`}
                   onClick={() => removeContextFile(path)}
@@ -1203,7 +1366,7 @@ function AgentWorkspace({
         {showContextPicker ? (
           <div className="agent-context-picker">
             <div className="agent-context-heading">
-              <strong>选择项目上下文</strong>
+              <strong>固定关注文件（可选）</strong>
               <span>
                 {indexStatus?.state === 'indexing'
                   ? '正在建立索引'
@@ -1254,7 +1417,9 @@ function AgentWorkspace({
                   <p>没有找到匹配结果。</p>
                 )
               ) : (
-                <p>输入搜索词后选择相关文件和符号。</p>
+                <p>
+                  Agent 默认可以搜索和读取整个项目；这里只用于固定额外关注的文件或符号。
+                </p>
               )}
             </div>
           </div>
@@ -1289,7 +1454,7 @@ function AgentWorkspace({
                 disabled={status !== 'idle'}
                 onClick={() => setShowContextPicker((current) => !current)}
               >
-                @ 添加上下文
+                @ 固定关注文件
               </button>
             </div>
             {status === 'running' ||
@@ -1318,9 +1483,38 @@ function AgentWorkspace({
         </div>
       </div>
 
+      {showChanges ? (
+        <FloatingDetailWindow
+          title="本轮变更"
+          subtitle={`${agentChangedFiles.length} 个文件`}
+          onClose={() => setShowChanges(false)}
+        >
+          <div className="agent-change-window-list">
+            {agentChangedFiles.map((file) => (
+              <button
+                className={`change-${file.kind}`}
+                type="button"
+                key={file.path}
+                disabled={file.kind === 'deleted'}
+                title={
+                  file.kind === 'deleted'
+                    ? `已删除：${file.path}`
+                    : `预览 ${file.path}`
+                }
+                onClick={() => onOpenFile(file.path)}
+              >
+                <small>{fileChangeLabel(file.kind)}</small>
+                <span>{file.path}</span>
+              </button>
+            ))}
+          </div>
+        </FloatingDetailWindow>
+      ) : null}
+
       {diffCheckpointId ? (
         <CheckpointDiffModal
           checkpointId={diffCheckpointId}
+          theme={editorTheme}
           onClose={() => setDiffCheckpointId(null)}
         />
       ) : null}

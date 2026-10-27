@@ -13,6 +13,7 @@ export interface CommandItem {
 interface CommandPaletteProps {
   commands: CommandItem[]
   onClose: () => void
+  placeholder?: string
 }
 
 function scoreCommand(command: CommandItem, query: string): number {
@@ -50,7 +51,8 @@ function scoreCommand(command: CommandItem, query: string): number {
 
 function CommandPalette({
   commands,
-  onClose
+  onClose,
+  placeholder = '搜索命令、项目操作或 Agent 任务'
 }: CommandPaletteProps): React.JSX.Element {
   const [query, setQuery] = useState('')
   const [selectedIndex, setSelectedIndex] = useState(0)
@@ -111,7 +113,7 @@ function CommandPalette({
           <input
             ref={inputRef}
             value={query}
-            placeholder="搜索命令、项目操作或 Agent 任务"
+            placeholder={placeholder}
             spellCheck={false}
             onChange={(event) => setQuery(event.target.value)}
             onKeyDown={(event) => {
